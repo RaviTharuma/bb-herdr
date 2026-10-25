@@ -19,3 +19,7 @@ languageBoundary:
   rust: [conditional process containment, conditional cleanup receipt]
   excludedFromRust: [provider semantics, conversations, approvals, recovery, workspace policy]
 ```
+
+## Hosted process lifecycle
+
+The registry is an internal durable fence and transaction journal. Public launches return a live `ManagedHostedBridge`. Expectation registration is part of the launch transaction: pane creation or persistence failure revokes the expectation, closes an owned pane, and records failure. Runner output uses serialized, drain-aware writes with a bounded pending-byte window; controller streams use bounded consumable queues.

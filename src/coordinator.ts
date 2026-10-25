@@ -1,16 +1,18 @@
 import { randomBytes } from "node:crypto";
 import type { HerdrClient } from "./herdr.js";
+import type { ControllerSession } from "./controller.js";
 import { Registry, type LaunchRecord } from "./registry.js";
 
+export type ManagedHostedBridge = ControllerSession;
 export type Launch = { launchId: string; command: string[]; cwd: string; env?: Record<string, string> };
 const HERDR_TARGETS = ["HERDR_SOCKET", "HERDR_WORKSPACE", "HERDR_WORKSPACE_ID", "HERDR_PANE", "HERDR_PANE_ID"];
 
 export class LaunchCoordinator {
-  #pending = new Map<string, Promise<LaunchRecord>>();
-  constructor(readonly registry: Registry, readonly herdr: HerdrClient, readonly runner: string, readonly socket: string, readonly controller?: { expect(association: { launchId: string; token: string }): unknown }) {}
+  #pending = new Map<string, Promise<ManagedHostedBridge>>();
+  constructor(readonly registry: Registry, readonly herdr: HerdrClient, readonly runner: string, readonly socket: string, readonly controller: { expect(association: { launchId: string; token: string }): ControllerSession; revoke(launchId: string, error?: Error): boolean }) {}
   launch(launch: Launch) {
     const old = this.registry.get(launch.launchId);
-    if (old && old.state !== "failed") return Promise.resolve(old);
+    if (old && old.state !== "failed") return Promise.reject(new Error("launch already exists"));
     const pending = this.#pending.get(launch.launchId);
     if (pending) return pending;
     const attempt = this.#launch(launch, (old?.generation ?? 0) + 1).finally(() => this.#pending.delete(launch.launchId));
@@ -20,7 +22,7 @@ export class LaunchCoordinator {
   async #launch(launch: Launch, generation: number) {
     const token = randomBytes(24).toString("hex");
     let record = await this.registry.put({ launchId: launch.launchId, token, generation, state: "launching", started: false });
-    this.controller?.expect({ launchId: launch.launchId, token });
+    const session = this.controller.expect({ launchId: launch.launchId, token });
     const environment: Record<string, string> = { ...(launch.env ?? {}) };
     for (const name of HERDR_TARGETS) delete environment[name];
     Object.assign(environment, { BB_HERDR_LAUNCH_ID: launch.launchId, BB_HERDR_TOKEN: token, BB_HERDR_SOCKET: this.socket });
@@ -28,8 +30,12 @@ export class LaunchCoordinator {
     try {
       paneId = await this.herdr.openPane([this.runner, "--", ...launch.command], launch.cwd, environment);
       record = { ...record, paneId, state: "ready" };
-      return await this.registry.put(record);
+      await this.registry.put(record);
+      session.started.then(() => this.start(launch.launchId, token)).catch(() => {});
+      session.closed.then(() => this.cleanup(launch.launchId, token)).catch(() => {});
+      return session;
     } catch (error) {
+      this.controller.revoke(launch.launchId, error instanceof Error ? error : new Error(String(error)));
       if (paneId) {
         try { await this.herdr.closePane(paneId); } catch {}
       }
@@ -47,6 +53,7 @@ export class LaunchCoordinator {
   async cancel(id: string) {
     const record = this.registry.get(id);
     if (!record) return false;
+    this.controller.revoke(id, new Error("launch cancelled"));
     if (record.paneId) await this.herdr.closePane(record.paneId);
     await this.registry.put({ ...record, state: "cancelled" });
     return true;

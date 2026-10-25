@@ -4,6 +4,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Registry } from "../src/registry";
+import { ControllerTransport } from "../src/controller";
 import { LaunchCoordinator } from "../src/coordinator";
 import { UnixHerdrClient } from "../src/herdr";
 
@@ -16,7 +17,7 @@ const setup = async (herdr?: any) => {
     openPane: async (...args: any[]) => { calls.push(["open", ...args]); return "pane-1"; },
     closePane: async (id: string) => { calls.push(["close", id]); },
   };
-  return { directory, registry, calls, coordinator: new LaunchCoordinator(registry, client, "runner", join(directory, "socket")) };
+  return { directory, registry, calls, coordinator: new LaunchCoordinator(registry, client, "runner", join(directory, "socket"), new ControllerTransport(join(directory, "control"))) };
 };
 
 async function socketServer(reply: (socket: import("node:net").Socket) => void) {
@@ -38,8 +39,8 @@ describe("launch durability", () => {
     expect(failed.state).toBe("failed");
     expect(failed.generation).toBe(1);
     const retried = await subject.coordinator.launch({ launchId: "a", command: ["x"], cwd: "/tmp" });
-    expect(retried.generation).toBe(2);
-    expect(retried.token).not.toBe(failed.token);
+    expect(subject.registry.get("a")?.generation).toBe(2);
+    expect(retried.association.token).not.toBe(failed.token);
     await expect(subject.coordinator.cleanup("a", failed.token)).rejects.toThrow("stale");
   });
 

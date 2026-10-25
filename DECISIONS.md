@@ -25,3 +25,10 @@ languageDecision:
   rustGate: measured supervision failure
   protocol: versioned local IPC
 ```
+
+```toon
+- date: 2026-10-25
+  decision: Public hosted launches return ManagedHostedBridge while registry records remain internal.
+- date: 2026-10-25
+  decision: Hosted output is consumable and byte-bounded with producer backpressure; history is not retained.
+```

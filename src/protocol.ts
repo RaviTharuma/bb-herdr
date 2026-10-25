@@ -7,6 +7,7 @@ export type Frame =
   | { type: "data"; stream: "stdin" | "stdout" | "stderr"; bytes: string }
   | { type: "eof"; stream: "stdin" }
   | { type: "cancel"; launchId: string }
+  | { type: "window"; bytes: number }
   | { type: "exit"; code: number | null; signal: string | null }
   | { type: "cleanup"; launchId: string; token: string };
 
@@ -20,6 +21,7 @@ export function parseFrame(value: unknown): Frame {
   switch (frame.type) {
     case "hello": if (keys(frame, ["type", "launchId", "token"]) && text(frame.launchId) && text(frame.token)) return frame as Frame; break;
     case "start": case "cancel": if (keys(frame, ["type", "launchId"]) && text(frame.launchId)) return frame as Frame; break;
+    case "window": if (keys(frame, ["type", "bytes"]) && Number.isSafeInteger(frame.bytes) && Number(frame.bytes) > 0) return frame as Frame; break;
     case "data": if (keys(frame, ["type", "stream", "bytes"]) && ["stdin", "stdout", "stderr"].includes(String(frame.stream)) && canonicalBase64(frame.bytes)) return frame as Frame; break;
     case "eof": if (keys(frame, ["type", "stream"]) && frame.stream === "stdin") return frame as Frame; break;
     case "exit": if (keys(frame, ["type", "code", "signal"]) && (frame.code === null || Number.isInteger(frame.code)) && (frame.signal === null || text(frame.signal))) return frame as Frame; break;

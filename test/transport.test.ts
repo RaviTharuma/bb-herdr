@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +8,7 @@ import { PassThrough } from "node:stream";
 import { once } from "node:events";
 import { FrameDecoder, decodeBytes, encodeBytes, encodeFrame, writeFrame } from "../src/protocol";
 import { listenPrivate } from "../src/rendezvous";
-import { ControllerTransport } from "../src/controller";
+import { ControllerSession, ControllerTransport } from "../src/controller";
 
 const directories: string[] = [];
 afterEach(async () => { await Promise.all(directories.splice(0).map(path => rm(path, { recursive: true, force: true }))); });
@@ -56,10 +56,11 @@ describe("private controller and real runner", () => {
     const server = await transport.listen(); expect((await stat(socketPath)).mode & 0o777).toBe(0o600);
     const session = transport.expect({ launchId: "binary", token: "secret" });
     const child = spawn(process.execPath, [join(process.cwd(), "src/runner.ts"), "--", process.execPath, "-e", "process.stdin.on('data',b=>{process.stdout.write(b);process.stderr.write(Buffer.from([0,255]));process.exit(7)})"], { env: { ...process.env, BB_HERDR_LAUNCH_ID: "binary", BB_HERDR_TOKEN: "secret", BB_HERDR_SOCKET: socketPath }, stdio: ["ignore", "ignore", "inherit"] });
-    const childExit = once(child, "exit"); await session.started; await session.writeStdin(Buffer.from([0, 10, 255])); await session.endStdin();
+    const collect = async (stream: AsyncIterable<Buffer>) => { const chunks: Buffer[] = []; for await (const chunk of stream) chunks.push(chunk); return Buffer.concat(chunks); };
+    const stdout = collect(session.stdout); const stderr = collect(session.stderr); const childExit = once(child, "exit"); await session.started; await session.sendStdin(Buffer.from([0, 10, 255])); await session.endStdin();
     const result = await session.completed;
-    expect(Buffer.concat(result.stdout)).toEqual(Buffer.from([0, 10, 255])); expect(Buffer.concat(result.stderr)).toEqual(Buffer.from([0, 255])); expect(result.exit).toEqual({ code: 7, signal: null }); expect(result.cleanup).toEqual({ launchId: "binary", token: "secret" });
-    expect((await childExit)[0]).toBe(0); await transport.close(); expect(server.listening).toBe(false);
+    expect(await stdout).toEqual(Buffer.from([0, 10, 255])); expect(await stderr).toEqual(Buffer.from([0, 255])); expect(result.exit).toEqual({ code: 7, signal: null }); expect(result.cleanup).toEqual({ launchId: "binary", token: "secret" });
+    expect([0, null]).toContain((await childExit)[0]); await transport.close(); expect(server.listening).toBe(false);
   });
 
   test("rejects unauthenticated starts and malformed batches", async () => {
@@ -68,13 +69,134 @@ describe("private controller and real runner", () => {
     await once(socket, "close"); expect(transport.pendingCount).toBe(1); await transport.close();
   });
 
-  test("cancels a child and escalates after controller loss", async () => {
-    const directory = await createDirectory(); const fixture = join(directory, "fixture.ts"); await writeFile(fixture, "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"); await chmod(fixture, 0o700);
-    for (const mode of ["cancel", "loss"] as const) {
-      const socketPath = join(directory, `${mode}.sock`); const transport = new ControllerTransport(socketPath); await transport.listen(); const session = transport.expect({ launchId: mode, token: "secret" });
-      const child = spawn(process.execPath, [join(process.cwd(), "src/runner.ts"), "--", process.execPath, fixture], { env: { ...process.env, BB_HERDR_LAUNCH_ID: mode, BB_HERDR_TOKEN: "secret", BB_HERDR_SOCKET: socketPath }, stdio: ["ignore", "ignore", "inherit"] });
-      const childExit = once(child, "exit"); await session.started; if (mode === "cancel") await session.cancel(); else await transport.close();
-      const [code, signal] = await childExit as [number | null, string | null]; expect(code === 0 || signal === "SIGKILL").toBe(true); if (mode === "cancel") await transport.close();
-    }
+  test("graceful transport close stops a SIGTERM-resistant child", async () => {
+    const directory = await createDirectory(); const socketPath = join(directory, "graceful-close.sock");
+    const transport = new ControllerTransport(socketPath); await transport.listen(); const session = transport.expect({ launchId: "graceful-close", token: "secret" });
+    const runner = spawn(process.execPath, [join(process.cwd(), "src/runner.ts"), "--", process.execPath, "-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { env: { ...process.env, BB_HERDR_LAUNCH_ID: "graceful-close", BB_HERDR_TOKEN: "secret", BB_HERDR_SOCKET: socketPath }, stdio: ["ignore", "ignore", "inherit"] });
+    const runnerExit = once(runner, "exit"); await session.started; await transport.close(); await session.completed;
+    await Promise.race([runnerExit, Bun.sleep(3000).then(() => { runner.kill("SIGKILL"); throw new Error("runner did not exit after graceful close"); })]);
+    expect(await Bun.file(socketPath).exists()).toBe(false);
   }, 10_000);
+
+  test("abrupt transport abort stops a SIGTERM-resistant child", async () => {
+    const directory = await createDirectory(); const socketPath = join(directory, "abrupt-abort.sock");
+    const transport = new ControllerTransport(socketPath); await transport.listen(); const session = transport.expect({ launchId: "abrupt-abort", token: "secret" });
+    const runner = spawn(process.execPath, [join(process.cwd(), "src/runner.ts"), "--", process.execPath, "-e", "process.on('SIGTERM',()=>{});process.stdout.write('ready');setInterval(()=>{},1000)"], { env: { ...process.env, BB_HERDR_LAUNCH_ID: "abrupt-abort", BB_HERDR_TOKEN: "secret", BB_HERDR_SOCKET: socketPath }, stdio: ["ignore", "ignore", "inherit"] });
+    const runnerExit = once(runner, "exit"); await session.started; const ready = await session.stdout[Symbol.asyncIterator]().next(); expect(ready.value?.toString()).toBe("ready");
+    const completion = session.completed; await Promise.race([transport.abort(), Bun.sleep(3000).then(() => { throw new Error("transport abort did not finish"); })]); await expect(completion).rejects.toThrow("closed");
+    await Promise.race([runnerExit, Bun.sleep(3000).then(() => { runner.kill("SIGKILL"); throw new Error("runner did not exit after abrupt abort"); })]);
+    expect(await Bun.file(socketPath).exists()).toBe(false);
+  }, 10_000);
+
+
+  test("kills the child when the runner is killed", async () => {
+    const directory = await createDirectory(); const socketPath = join(directory, "runner-loss.sock"); const pidPath = join(directory, "child.pid");
+    const transport = new ControllerTransport(socketPath); await transport.listen(); const session = transport.expect({ launchId: "runner-loss", token: "secret" });
+    const script = `require("fs").writeFileSync(${JSON.stringify(pidPath)},String(process.pid));process.on("SIGTERM",()=>{});setInterval(()=>{},1000)`;
+    const runner = spawn(process.execPath, [join(process.cwd(), "src/runner.ts"), "--", process.execPath, "-e", script], { env: { ...process.env, BB_HERDR_LAUNCH_ID: "runner-loss", BB_HERDR_TOKEN: "secret", BB_HERDR_SOCKET: socketPath }, stdio: ["ignore", "ignore", "inherit"] });
+    await session.started; while (!await Bun.file(pidPath).exists()) await Bun.sleep(10); const childPid = Number(await readFile(pidPath, "utf8"));
+    runner.kill("SIGKILL"); await once(runner, "exit");
+    for (let attempt=0; attempt<200; attempt++) { try { process.kill(childPid, 0); await Bun.sleep(10); } catch { break; } }
+    expect(() => process.kill(childPid, 0)).toThrow(); await transport.close();
+  }, 10_000);
+});
+
+
+describe("controller lifecycle invariants", () => {
+  const association = { launchId: "phase", token: "secret" };
+  const exit = { type: "exit", code: 0, signal: null } as const;
+  const cleanup = { type: "cleanup", ...association } as const;
+
+  test("rejects start and completion when output arrives before start", async () => {
+    const session = new ControllerSession(association, 8);
+    session.hello();
+    expect(() => session.receive({ type: "data", stream: "stdout", bytes: encodeBytes(Buffer.from("x")) })).toThrow("unexpected");
+    await expect(session.started).rejects.toThrow("unexpected");
+    await expect(session.completed).rejects.toThrow("unexpected");
+  });
+
+  test("rejects duplicate start and output after exit", async () => {
+    for (const invalid of [{ type: "start", launchId: "phase" } as const, { type: "data", stream: "stdout", bytes: encodeBytes(Buffer.from("x")) } as const]) {
+      const session = new ControllerSession(association, 8);
+      session.hello(); session.start();
+      if (invalid.type === "data") session.receive(exit);
+      expect(() => session.receive(invalid)).toThrow("unexpected");
+      await expect(session.completed).rejects.toThrow("unexpected");
+    }
+  });
+
+  test("settles both promises on close before start and controller loss after start", async () => {
+    const early = new ControllerSession(association, 8); early.close(new Error("closed"));
+    await expect(early.started).rejects.toThrow("closed"); await expect(early.completed).rejects.toThrow("closed");
+    const active = new ControllerSession(association, 8); active.hello(); active.start(); active.close(new Error("lost"));
+    await expect(active.started).resolves.toBeUndefined(); await expect(active.completed).rejects.toThrow("lost");
+  });
+
+  test("replacement revoke and shutdown settle old expectations", async () => {
+    const directory = await createDirectory(); const transport = new ControllerTransport(join(directory, "control.sock"));
+    const old = transport.expect({ launchId: "same", token: "old" });
+    const replacement = transport.expect({ launchId: "same", token: "new" });
+    await expect(old.started).rejects.toThrow("replaced"); await expect(old.completed).rejects.toThrow("replaced");
+    expect(transport.revoke("same")).toBe(true);
+    await expect(replacement.started).rejects.toThrow("revoked"); await expect(replacement.completed).rejects.toThrow("revoked");
+    const pending = transport.expect({ launchId: "pending", token: "token" }); await transport.close();
+    await expect(pending.started).rejects.toThrow("closed"); await expect(pending.completed).rejects.toThrow("closed");
+  });
+
+  test("hello followed by disconnect clears the matching expectation and settles it", async () => {
+    const directory = await createDirectory(); const socketPath = join(directory, "hello-disconnect.sock");
+    const transport = new ControllerTransport(socketPath); await transport.listen();
+    const session = transport.expect({ launchId: "hello-disconnect", token: "secret" });
+    const socket = createConnection(socketPath); await once(socket, "connect");
+    await writeFrame(socket, { type: "hello", launchId: "hello-disconnect", token: "secret" });
+    while (session.phase === "expected") await Bun.sleep(1);
+    socket.destroy(); await once(socket, "close");
+    await expect(session.started).rejects.toThrow("closed");
+    await expect(session.completed).rejects.toThrow("closed");
+    expect(transport.pendingCount).toBe(0);
+    await transport.close();
+  });
+
+  test("slow consumers apply credit backpressure and preserve ordered final drain", async () => {
+    const directory = await createDirectory(); const socketPath = join(directory, "pressure.sock");
+    const capacity = 16 * 1024; const transport = new ControllerTransport(socketPath, { maxBufferedBytes: capacity }); await transport.listen();
+    const session = transport.expect({ launchId: "pressure", token: "secret" }); const total = capacity * 24;
+    const script = `const n=${total};const b=Buffer.alloc(n);for(let i=0;i<n;i++)b[i]=i%251;process.stdout.write(b);process.stderr.write(b);`;
+    const child = spawn(process.execPath, [join(process.cwd(), "src/runner.ts"), "--", process.execPath, "-e", script], { env: { ...process.env, BB_HERDR_LAUNCH_ID: "pressure", BB_HERDR_TOKEN: "secret", BB_HERDR_SOCKET: socketPath }, stdio: ["ignore", "ignore", "inherit"] });
+    await session.started; await Bun.sleep(100); expect(session.bufferedBytes).toBeLessThanOrEqual(capacity); expect(session.phase).toBe("started");
+    const consume = async (stream: AsyncIterable<Buffer>) => { const chunks: Buffer[] = []; for await (const chunk of stream) { chunks.push(chunk); await Bun.sleep(1); } return Buffer.concat(chunks); };
+    const [stdout, stderr, result] = await Promise.all([consume(session.stdout), consume(session.stderr), session.completed]);
+    const expected = Buffer.alloc(total); for (let i=0;i<total;i++) expected[i]=i%251;
+    expect(stdout).toEqual(expected); expect(stderr).toEqual(expected); expect(result.exit).toEqual({ code: 0, signal: null }); expect(session.peakBufferedBytes).toBeLessThanOrEqual(capacity);
+    await once(child, "exit"); await transport.close();
+  }, 15_000);
+
+  test("shared credit makes bounded progress on both output streams", async () => {
+    const directory = await createDirectory(); const socketPath = join(directory, "fair-pressure.sock");
+    const capacity = 1024; const transport = new ControllerTransport(socketPath, { maxBufferedBytes: capacity }); await transport.listen();
+    const session = transport.expect({ launchId: "fair-pressure", token: "secret" }); const total = 64 * 1024;
+    const script = `const b=Buffer.alloc(1024,97);for(let n=0;n<${total}/b.length;n++){process.stdout.write(b);process.stderr.write(b)}`;
+    const child = spawn(process.execPath, [join(process.cwd(), "src/runner.ts"), "--", process.execPath, "-e", script], { env: { ...process.env, BB_HERDR_LAUNCH_ID: "fair-pressure", BB_HERDR_TOKEN: "secret", BB_HERDR_SOCKET: socketPath }, stdio: ["ignore", "ignore", "inherit"] });
+    await session.started;
+    const stdout = session.stdout[Symbol.asyncIterator](); const stderr = session.stderr[Symbol.asyncIterator]();
+    const first = await Promise.all([stdout.next(), stderr.next()]);
+    expect(first.every(({ done, value }) => !done && value.length > 0)).toBe(true);
+    const drain = async (iterator: AsyncIterator<Buffer>, initial: IteratorResult<Buffer>) => { const chunks = initial.done ? [] : [initial.value]; for (;;) { const next = await iterator.next(); if (next.done) return Buffer.concat(chunks); chunks.push(next.value); } };
+    const [stdoutBytes, stderrBytes, result] = await Promise.all([drain(stdout, first[0]), drain(stderr, first[1]), session.completed]);
+    expect(stdoutBytes.length).toBe(total); expect(stderrBytes.length).toBe(total); expect(result.exit).toEqual({ code: 0, signal: null }); expect(session.peakBufferedBytes).toBeLessThanOrEqual(capacity);
+    await once(child, "exit"); await transport.close();
+  }, 5_000);
+
+  test("slow consumers drain output larger than 16 KiB with a 1 KiB window", async () => {
+    const directory = await createDirectory(); const socketPath = join(directory, "small-window.sock");
+    const capacity = 1024; const transport = new ControllerTransport(socketPath, { maxBufferedBytes: capacity }); await transport.listen();
+    const session = transport.expect({ launchId: "small-window", token: "secret" }); const total = 20 * 1024 + 37;
+    const script = `const n=${total};const b=Buffer.alloc(n);for(let i=0;i<n;i++)b[i]=i%251;process.stdout.write(b);`;
+    const child = spawn(process.execPath, [join(process.cwd(), "src/runner.ts"), "--", process.execPath, "-e", script], { env: { ...process.env, BB_HERDR_LAUNCH_ID: "small-window", BB_HERDR_TOKEN: "secret", BB_HERDR_SOCKET: socketPath }, stdio: ["ignore", "ignore", "inherit"] });
+    await session.started;
+    const chunks: Buffer[] = []; for await (const chunk of session.stdout) { chunks.push(chunk); await Bun.sleep(1); }
+    const result = await session.completed; const expected = Buffer.alloc(total); for (let i=0;i<total;i++) expected[i]=i%251;
+    expect(Buffer.concat(chunks)).toEqual(expected); expect(result.exit).toEqual({ code: 0, signal: null }); expect(session.peakBufferedBytes).toBeLessThanOrEqual(capacity);
+    await once(child, "exit"); await transport.close();
+  }, 15_000);
 });

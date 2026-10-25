@@ -35,3 +35,7 @@ status: working local vertical slice
 transport: private Unix socket
 publication: prepack verified
 ```
+
+## Managed hosted bridge
+
+`launch` returns the live managed bridge rather than registry metadata. The bridge exposes `sendStdin`/`writeStdin`, `endStdin`, consumable async `stdout` and `stderr` streams, `started`, `exited`, `closed`, and `completed` promises, plus `cancel`/`stop`. Output queues are byte-bounded and release memory as consumers advance; output history is not retained. Protocol order is strict (`expected`, `hello`, `started`, `exited`, `cleaned`/`closed`) and every terminal path settles all lifecycle promises.
