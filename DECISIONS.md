@@ -32,3 +32,14 @@ languageDecision:
 - date: 2026-10-25
   decision: Hosted output is consumable and byte-bounded with producer backpressure; history is not retained.
 ```
+
+## 2026-10-25 — Release 0.2.0 runtime support
+
+The plugin supports Linux x64 and macOS arm64. It discovers Herdr through `HERDR_SOCKET` first and otherwise asks the running Herdr server for its configured socket. POSIX children run in an owned process group so cancellation reaches descendants.
+
+```toon
+runtimeSupport:
+  supported: [linux-x64, darwin-arm64]
+  socketOrder: [HERDR_SOCKET, Herdr server status]
+  processContainment: POSIX process group
+```

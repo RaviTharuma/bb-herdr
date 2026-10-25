@@ -26,7 +26,7 @@ if (process.send) process.send({ version: 1, type: "started" });
 const child = spawn(command[0]!, command.slice(1), {
   stdio: ["pipe", "pipe", "pipe"],
   env: process.env,
-  detached: false,
+  detached: process.platform !== "win32",
 });
 await Promise.race([
   once(child, "spawn"),
@@ -38,7 +38,8 @@ let isTerminating = false;
 let forceTimer: NodeJS.Timeout | undefined;
 const waiting: Array<() => void> = [];
 function signalChild(signal: NodeJS.Signals) {
-  child.kill(signal);
+  if (child.pid && process.platform !== "win32") process.kill(-child.pid, signal);
+  else child.kill(signal);
 }
 function terminate() {
   if (isTerminating || child.exitCode !== null || child.signalCode !== null) return;
@@ -47,7 +48,7 @@ function terminate() {
   signalChild("SIGTERM");
   forceTimer = setTimeout(() => {
     if (child.pid && child.exitCode === null && child.signalCode === null)
-      process.kill(child.pid, "SIGKILL");
+      process.kill(process.platform === "win32" ? child.pid : -child.pid, "SIGKILL");
   }, 250);
 }
 function disconnect() {
@@ -167,7 +168,7 @@ if (isDisconnected) {
   await writeFrame(socket, { type: "exit", code, signal });
   await writeFrame(socket, { type: "cleanup", launchId, token });
   socket.end();
-  socket.destroy();
+  await Promise.race([once(socket, "close"), new Promise<void>((resolve) => setTimeout(resolve, 100))]);
 }
 if (process.send) process.send({ version: 1, type: "completed" });
 if (process.connected) process.disconnect?.();

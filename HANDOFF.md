@@ -15,3 +15,16 @@ managedHostedBridge:
   api: live streams and lifecycle promises
   verification: pending final commands
 ```
+
+## Release 0.2.0
+
+```toon
+release:
+  branch: release/0.2.0
+  status: built and locally verified, not committed or pushed
+  plugin: BB-native package layout
+  artifacts: [dist/server.js, dist/server.meta.json]
+  platforms: [linux-x64, darwin-arm64]
+  verification: 31 tests passing repeatedly; typecheck and native BB build passing
+  productionConfigTouched: false
+```

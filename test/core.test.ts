@@ -2,3 +2,18 @@ import{describe,expect,test}from"bun:test";import{mkdtemp,readFile}from"node:fs/
 const setup=async()=>{const d=await mkdtemp(join(tmpdir(),"bbh-"));const r=new Registry(join(d,"r.json"));await r.load();const calls:any[]=[];const h={openPane:async(...x:any[])=>{calls.push(["open",...x]);return"p1"},closePane:async(id:string)=>{calls.push(["close",id])}};return{d,r,calls,c:new LaunchCoordinator(r,h,"runner",join(d,"s"),new ControllerTransport(join(d,"control")))}};
 describe("launch lifecycle",()=>{test("coalesces duplicate launch and starts once",async()=>{const{x=undefined,...s}=await setup();const a=s.c.launch({launchId:"a",command:["x"],cwd:"/tmp"});const b=s.c.launch({launchId:"a",command:["x"],cwd:"/tmp"});const [r1,r2]=await Promise.all([a,b]);expect(r1).toBe(r2);expect(s.calls).toHaveLength(1);expect(await s.c.start("a",s.r.get("a")!.token)).toBe(true);expect(await s.c.start("a",s.r.get("a")!.token)).toBe(false)});test("cancels and fences unknown cleanup",async()=>{const s=await setup();const r=await s.c.launch({launchId:"a",command:["x"],cwd:"/tmp"});expect(await s.c.cancel("a")).toBe(true);expect(s.r.get("a")?.state).toBe("cancelled");expect(s.c.cleanup("missing",s.r.get("a")!.token)).resolves.toBe(false)});test("isolates control environment",async()=>{const s=await setup();await s.c.launch({launchId:"a",command:["x"],cwd:"/tmp",env:{HOME:"bad",PATH:"bad",KEEP:"yes"}});expect(s.calls[0][3]).toMatchObject({KEEP:"yes"});expect(s.calls[0][3].HOME).toBe("bad");expect(s.calls[0][3].PATH).toBe("bad")});test("persists registry",async()=>{const s=await setup();const x=await s.c.launch({launchId:"a",command:["x"],cwd:"/tmp"});expect(JSON.parse(await readFile(join(s.d,"r.json"),"utf8"))[0].token).toBe(x.association.token)})});
 test("preserves bytes across chunks and final drain",async()=>{const bytes=Buffer.from([0,255,10,13,1]);const f={type:"data",stream:"stdout",bytes:encodeBytes(bytes)}as const;const wire=Buffer.from(JSON.stringify(f)+"\n");const d=new FrameDecoder();expect(d.push(wire.subarray(0,3))).toEqual([]);const got=d.push(wire.subarray(3));d.end();expect(decodeBytes((got[0]as any).bytes)).toEqual(bytes);const out=new PassThrough({highWaterMark:1});let all=Buffer.alloc(0);out.on("data",b=>all=Buffer.concat([all,b]));await writeFrame(out,f);out.end();await new Promise(r=>out.once("end",r));expect(all.at(-1)).toBe(10)});
+
+
+describe("runtime discovery", () => {
+  test("prefers HERDR_SOCKET and otherwise uses the socket reported by Herdr", async () => {
+    const { resolveHerdrSocket } = await import("../src/server.js");
+    expect(await resolveHerdrSocket({ HERDR_SOCKET: "/explicit.sock" }, async () => "/configured.sock")).toBe("/explicit.sock");
+    expect(await resolveHerdrSocket({}, async () => "/configured.sock")).toBe("/configured.sock");
+  });
+  test("rejects unsupported runtime platforms", async () => {
+    const { assertSupportedRuntime } = await import("../src/server.js");
+    expect(() => assertSupportedRuntime("linux", "x64")).not.toThrow();
+    expect(() => assertSupportedRuntime("darwin", "arm64")).not.toThrow();
+    expect(() => assertSupportedRuntime("darwin", "x64")).toThrow(/unsupported/);
+  });
+});
