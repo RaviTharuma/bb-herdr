@@ -1,3 +1,34 @@
-import {mkdir,readFile,rename,writeFile} from "node:fs/promises";import {dirname} from "node:path";
-export type LaunchRecord={launchId:string;token:string;state:"launching"|"ready"|"running"|"cancelled"|"exited";paneId?:string;started:boolean};
-export class Registry{#records=new Map<string,LaunchRecord>();constructor(readonly path:string){}async load(){try{for(const x of JSON.parse(await readFile(this.path,"utf8")) as LaunchRecord[])this.#records.set(x.launchId,x)}catch(e:any){if(e.code!=="ENOENT")throw e}}get(id:string){return this.#records.get(id)} values(){return [...this.#records.values()]} async put(x:LaunchRecord){this.#records.set(x.launchId,x);await this.#save();return x}async #save(){await mkdir(dirname(this.path),{recursive:true,mode:0o700});const t=this.path+`.${process.pid}.tmp`;await writeFile(t,JSON.stringify(this.values()),{mode:0o600});await rename(t,this.path)}}
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
+
+export type LaunchState = "launching" | "ready" | "running" | "cancelled" | "exited" | "failed";
+export type LaunchRecord = { launchId: string; token: string; generation: number; state: LaunchState; paneId?: string; started: boolean; error?: string };
+
+export class Registry {
+  #records = new Map<string, LaunchRecord>();
+  constructor(readonly path: string) {}
+  async load() {
+    try {
+      for (const record of JSON.parse(await readFile(this.path, "utf8")) as LaunchRecord[]) {
+        this.#records.set(record.launchId, { ...record, generation: record.generation ?? 1 });
+      }
+    } catch (error: any) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  get(id: string) { return this.#records.get(id); }
+  values() { return [...this.#records.values()]; }
+  async put(record: LaunchRecord) {
+    const next = new Map(this.#records);
+    next.set(record.launchId, record);
+    await this.#save([...next.values()]);
+    this.#records = next;
+    return record;
+  }
+  async #save(records: LaunchRecord[]) {
+    await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
+    const temporary = this.path + `.${process.pid}.${crypto.randomUUID()}.tmp`;
+    await writeFile(temporary, JSON.stringify(records), { mode: 0o600 });
+    await rename(temporary, this.path);
+  }
+}
